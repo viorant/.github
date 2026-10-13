@@ -1,0 +1,123 @@
+name: Notify on failure (reusable)
+
+# Posts one line to #engineering when a run failed: repo, failing step, job, run
+# link. When the failing step is the SCA gate it adds the advisories the gate
+# printed ("SEV GHSA-… module"), so the message says what to upgrade without
+# anyone opening the run.
+#
+# Add a final job to the caller's workflow (daily.yml, security-scan.yml, …):
+#
+#   notify:
+#     needs: deep                # every job whose failure should be announced
+#     if: failure()              # first line of defence; this workflow checks too
+#     permissions:
+#       contents: read
+#       actions: read            # REQUIRED — see below
+#     uses: viorant/.github/.github/workflows/notify-failure.yml@main
+#     secrets: inherit
+#
+# `actions: read` has to be granted on the caller's JOB. A called workflow cannot
+# raise its own permissions above the caller's, and most callers set a top-level
+# `contents: read`, which would otherwise leave this workflow unable to read the
+# run's jobs. Without it the lookup fails, the run warns, and Slack gets a generic
+# line that links the run but does not name the step.
+#
+# What it reads: the caller's run (in a called workflow `github.run_id` and
+# `github.repository` are the caller's) via the jobs API, to find each failed job's
+# first failing step, and — only when that step is the SCA gate — that job's log,
+# to list the advisories. Log wording drifting from the parser degrades visibly
+# ("3 advisories, 2 listed") or to the step name alone; it never fails the run.
+#
+# Like pr-slack.yml it is not a required check and cannot gate a merge. A missing
+# SLACK_ENG_WEBHOOK warns and posts nothing — it never turns a red run into two.
+
+on:
+  workflow_call:
+    inputs:
+      sca-step-name:
+        description: Name of the SCA gate step; only a failure of this step gets an advisories line.
+        type: string
+        required: false
+        default: 'SCA gate (prod tier)'
+    secrets:
+      # Same secret, same channel as pr-slack.yml. No fallback to
+      # SLACK_RELEASE_WEBHOOK: that targets #release.
+      SLACK_ENG_WEBHOOK:
+        description: Incoming webhook for #engineering. Absent → the run warns and posts nothing.
+        required: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # One step decides everything, so the posting step stays a dumb executor
+      # and every skip reason lands in the log.
+      - name: Find the failed step and decide whether to post
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SCA_STEP: ${{ inputs.sca-step-name }}
+        run: |
+          set -euo pipefail
+
+          out() { printf '%s<<NOTIFYFAIL_EOF\n%s\nNOTIFYFAIL_EOF\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+
+          dir="$RUNNER_TEMP/notify-failure"
+          mkdir -p "$dir"
+
+          # `--jq` runs per page, so the pages merge into one `{jobs: [...]}`.
+          if ! gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" --paginate --jq '.jobs[]' \
+               | jq -s '{jobs: .}' > "$dir/jobs.json"; then
+            echo "::warning::notify-failure: could not read the run's jobs (does the caller job grant 'actions: read'?) — posting a line without the step"
+            rm -f "$dir/jobs.json"
+            echo 'post=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          failed="$(jq '[.jobs[] | select(any(.steps[]?; .conclusion == "failure"))] | length' "$dir/jobs.json")"
+          if [ "$failed" -eq 0 ]; then
+            echo 'notify-failure: no failed step in this run — nothing to announce'
+            echo 'post=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Only the SCA gate's log is worth the download: it is the one whose
+          # output carries something the Slack line can say.
+          jq -r --arg sca "$SCA_STEP" \
+            '.jobs[] | select(([.steps[]? | select(.conclusion == "failure")][0].name // "") == $sca) | .id' \
+            "$dir/jobs.json" |
+            while read -r job_id; do
+              if ! gh api "repos/$REPO/actions/jobs/$job_id/logs" > "$dir/$job_id.log"; then
+                echo "::warning::notify-failure: could not fetch the log of job $job_id — posting without advisories"
+                rm -f "$dir/$job_id.log"
+              fi
+            done
+
+          out dir "$dir"
+          out jobs_file "$dir/jobs.json"
+          echo 'post=true' >> "$GITHUB_OUTPUT"
+
+      - name: Check out the notifier
+        if: steps.gate.outputs.post == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: viorant/.github
+          ref: main
+          sparse-checkout: scripts/notify-failure
+          persist-credentials: false
+
+      - name: Post to Slack
+        if: steps.gate.outputs.post == 'true'
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_ENG_WEBHOOK }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          JOBS_FILE: ${{ steps.gate.outputs.jobs_file }}
+          LOG_DIR: ${{ steps.gate.outputs.dir }}
+          SCA_STEP_NAME: ${{ inputs.sca-step-name }}
+        run: node scripts/notify-failure/notify.mjs
