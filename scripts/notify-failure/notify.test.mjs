@@ -241,7 +241,7 @@ test('mrkdwn is escaped in step names, job names and advisory modules', () => {
   );
   assert.match(t, /Step &lt;script&gt; &amp; co/);
   assert.match(t, /j&lt;1&gt;/);
-  assert.doesNotMatch(t, /<script>/);
+  assert.ok(!t.toLowerCase().includes('<script'), 'raw angle bracket leaked into mrkdwn');
 
   const log = withTs([
     '##[error]1 un-suppressed HIGH/CRITICAL advisory(ies) in shipped dependencies:',
