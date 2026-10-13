@@ -15,6 +15,8 @@ jobs:
           node-version: 22
       - name: Test the PR → Slack notifier
         run: node --test 'scripts/pr-slack/*.test.mjs'
+      - name: Test the notify-on-failure notifier
+        run: node --test 'scripts/notify-failure/*.test.mjs'
       - name: Shellcheck the reusable workflow's gate script
         run: |
           set -euo pipefail
@@ -27,3 +29,41 @@ jobs:
           print(gate['run'])
           PY
           shellcheck --severity=warning /tmp/gate.sh
+      - name: Shellcheck the notify-on-failure workflow's gate script
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > /tmp/notify-failure-gate.sh
+          import yaml
+          wf = yaml.safe_load(open('.github/workflows/notify-failure.yml'))
+          steps = wf['jobs']['notify']['steps']
+          gate = next(s for s in steps if s.get('id') == 'gate')
+          print('#!/usr/bin/env bash')
+          print(gate['run'])
+          PY
+          shellcheck --severity=warning /tmp/notify-failure-gate.sh
+      # node --test has no zero-dependency YAML parser, so the workflow's contract
+      # is asserted here. Each line is something a caller silently depends on.
+      - name: Assert the notify-on-failure workflow's shape
+        run: |
+          python3 - <<'PY'
+          import yaml
+          wf = yaml.safe_load(open('.github/workflows/notify-failure.yml'))
+          # PyYAML reads the bare key `on` as boolean True.
+          trigger = wf.get('on', wf.get(True))
+          call = trigger['workflow_call']
+          secret = call['secrets']['SLACK_ENG_WEBHOOK']
+          assert secret['required'] is False, 'SLACK_ENG_WEBHOOK must be optional: a missing secret warns, never fails'
+          assert call['inputs']['sca-step-name']['default'] == 'SCA gate (prod tier)'
+          perms = wf['jobs']['notify']['permissions']
+          assert perms['actions'] == 'read', 'the jobs API needs actions: read'
+          assert perms['contents'] == 'read'
+          # The runner's gh (>= 2.97.0) refuses a response carrying terminal escape
+          # sequences, and every job log has them (the runner echoes each `run:`
+          # script in ANSI colour). Without the flag the fetch always fails and the
+          # advisories line never posts; a stubbed gh cannot see that.
+          gate = next(s for s in wf['jobs']['notify']['steps'] if s.get('id') == 'gate')
+          fetch = [l for l in gate['run'].splitlines() if 'actions/jobs/' in l and '/logs' in l]
+          assert len(fetch) == 1, 'expected exactly one job-log fetch in the gate'
+          assert '--allow-escape-sequences' in fetch[0], 'the job-log fetch needs gh api --allow-escape-sequences'
+          print('notify-failure.yml shape ok')
+          PY
