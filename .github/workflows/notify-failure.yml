@@ -92,7 +92,7 @@ jobs:
             '.jobs[] | select(([.steps[]? | select(.conclusion == "failure")][0].name // "") == $sca) | .id' \
             "$dir/jobs.json" |
             while read -r job_id; do
-              if ! gh api "repos/$REPO/actions/jobs/$job_id/logs" > "$dir/$job_id.log"; then
+              if ! gh api --allow-escape-sequences "repos/$REPO/actions/jobs/$job_id/logs" > "$dir/$job_id.log"; then
                 echo "::warning::notify-failure: could not fetch the log of job $job_id — posting without advisories"
                 rm -f "$dir/$job_id.log"
               fi

@@ -57,5 +57,13 @@ jobs:
           perms = wf['jobs']['notify']['permissions']
           assert perms['actions'] == 'read', 'the jobs API needs actions: read'
           assert perms['contents'] == 'read'
+          # The runner's gh (>= 2.97.0) refuses a response carrying terminal escape
+          # sequences, and every job log has them (the runner echoes each `run:`
+          # script in ANSI colour). Without the flag the fetch always fails and the
+          # advisories line never posts; a stubbed gh cannot see that.
+          gate = next(s for s in wf['jobs']['notify']['steps'] if s.get('id') == 'gate')
+          fetch = [l for l in gate['run'].splitlines() if 'actions/jobs/' in l and '/logs' in l]
+          assert len(fetch) == 1, 'expected exactly one job-log fetch in the gate'
+          assert '--allow-escape-sequences' in fetch[0], 'the job-log fetch needs gh api --allow-escape-sequences'
           print('notify-failure.yml shape ok')
           PY
